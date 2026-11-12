@@ -1,4 +1,4 @@
-const VERSION = 'obrario-v5';
+const VERSION = 'obrario-v13';
 const FILES = [
   './',
   './index.html',
