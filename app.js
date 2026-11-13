@@ -36,11 +36,13 @@
   let visits = [];
   let people = [];
   let materials = [];
+  let purchases = [];
+  let tasks = [];
   const state = { q: '', who: '' };
 
   const reqP = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   const openDB = () => new Promise((res, rej) => {
-    const r = indexedDB.open('obrario', 4);
+    const r = indexedDB.open('obrario', 6);
     r.onupgradeneeded = () => {
       const d = r.result;
       if (!d.objectStoreNames.contains('sites')) d.createObjectStore('sites', { keyPath: 'id' });
@@ -54,6 +56,8 @@
       }
       if (!d.objectStoreNames.contains('people')) d.createObjectStore('people', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('materials')) d.createObjectStore('materials', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('purchases')) d.createObjectStore('purchases', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('tasks')) d.createObjectStore('tasks', { keyPath: 'id' });
     };
     r.onblocked = () => {
       const a = document.getElementById('app');
@@ -71,19 +75,19 @@
   const PHOTO_MAX = 1280;      // lado largo en píxeles
   const PHOTO_QUALITY = 0.72;  // calidad JPEG
 
-  function compress(file) {
+  function compress(file, max = PHOTO_MAX, quality = PHOTO_QUALITY) {
     return new Promise((res, rej) => {
       const url = URL.createObjectURL(file);
       const img = new Image();
       img.onload = () => {
-        const k = Math.min(1, PHOTO_MAX / Math.max(img.naturalWidth, img.naturalHeight));
+        const k = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
         const w = Math.round(img.naturalWidth * k);
         const h = Math.round(img.naturalHeight * k);
         const c = document.createElement('canvas');
         c.width = w; c.height = h;
         c.getContext('2d').drawImage(img, 0, 0, w, h);
         URL.revokeObjectURL(url);
-        res(c.toDataURL('image/jpeg', PHOTO_QUALITY));
+        res(c.toDataURL('image/jpeg', quality));
       };
       img.onerror = () => { URL.revokeObjectURL(url); rej(new Error('No se pudo leer la foto')); };
       img.src = url;
@@ -532,6 +536,7 @@
   function render() {
     const rid = reportSiteId();
     if (rid) { renderReport(rid); return; }
+    if (location.hash === '#p') { renderPlan(); return; }
     const id = currentSiteId();
     if (id) renderSite(id); else renderList();
   }
@@ -545,12 +550,13 @@
   function renderList() {
     app.innerHTML = `
       <div id="agenda"></div>
-      <div class="home-tools"><button type="button" class="btn small" id="btnPeople">Colaboradores${people.length ? ` · ${people.length}` : ''}</button><button type="button" class="btn small" id="btnMats">Materiales${materials.length ? ` · ${materials.length}` : ''}</button></div>
+      <div class="home-tools"><button type="button" class="btn small" id="btnPlan">Plan${planCountToday() ? ` · hoy ${planCountToday()}` : ''}</button><button type="button" class="btn small" id="btnPeople">Colaboradores${people.length ? ` · ${people.length}` : ''}</button><button type="button" class="btn small" id="btnMats">Materiales${materials.length ? ` · ${materials.length}` : ''}</button></div>
       <div class="search"><input id="q" type="search" placeholder="Buscar sitio o dirección" value="${esc(state.q)}" aria-label="Buscar sitio"></div>
       <ul class="sites" id="siteList"></ul>`;
     $('#q').addEventListener('input', e => { state.q = e.target.value; drawSites(); });
     drawSites();
     drawAgenda();
+    $('#btnPlan').onclick = () => { location.hash = '#p'; };
     $('#btnPeople').onclick = peopleSheet;
     $('#btnMats').onclick = materialsSheet;
     setDock('+ Nuevo sitio', () => siteSheet());
@@ -672,6 +678,7 @@
           ${days.length ? `<button type="button" class="btn small" id="toggleView">${view === 'fechas' ? 'Ver detallado' : 'Ver por fechas'}</button>` : ''}
         </div>
       </div>
+      ${planHTML(id)}
       ${todosHTML(s)}
       ${siteAgendaHTML(id)}
       ${body}`;
@@ -682,6 +689,7 @@
     app.querySelectorAll('.daytab').forEach(b => { b.onclick = () => daySheet(id, b.dataset.d); });
     $('#addVisit').onclick = () => visitForm(id);
     bindVisits(app);
+    bindPlan(id);
     bindTodos(s);
     bindEntries(app, id);
     setDock('+ Nueva entrada', () => entrySheet(id));
@@ -708,6 +716,7 @@
   function materialsSheet() {
     openSheet(`
       <h2>Banco de materiales</h2>
+      ${matTabs('bank')}
       <input class="field" id="mbq" type="search" placeholder="Buscar material" aria-label="Buscar material" autocomplete="off">
       <div class="chips" id="mbf">
         <button type="button" data-f="all" class="on">Todos</button>
@@ -721,6 +730,7 @@
         <button type="button" class="btn ghost block" data-close>Cerrar</button>
       </div>
       <p class="hint">Aquí guardas tu catálogo. Al anotar material en una entrada, escribes unas letras, eliges de la lista y pones solo la cantidad.</p>`);
+    bindMatTabs();
     let filt = 'all';
     const lowCount = materials.filter(isLow).length;
     $('#mbf [data-f=low]').textContent = lowCount ? `Por comprar · ${lowCount}` : 'Por comprar';
@@ -760,6 +770,200 @@
       materialsSheet();
       toast(`Añadidos ${n} materiales`);
     };
+  }
+
+  /* ---------- Ingresos de material (compras con foto de factura) ---------- */
+  const PURCHASE_MAX = 1600;      // las facturas necesitan más resolución para leerse
+  const PURCHASE_QUALITY = 0.75;
+  const sortedPurchases = () => [...purchases].sort((a, b) => (b.date + String(b.created || 0).padStart(15, '0')).localeCompare(a.date + String(a.created || 0).padStart(15, '0')));
+  const matTabs = on => `<div class="chips" id="mtabs"><button type="button" data-t="bank"${on === 'bank' ? ' class="on"' : ''}>Materiales</button><button type="button" data-t="buys"${on === 'buys' ? ' class="on"' : ''}>Ingresos${purchases.length ? ` · ${purchases.length}` : ''}</button></div>`;
+  function bindMatTabs() {
+    $('#mtabs').addEventListener('click', ev => {
+      const b = ev.target.closest('button[data-t]');
+      if (!b || b.classList.contains('on')) return;
+      if (b.dataset.t === 'buys') purchasesSheet(); else materialsSheet();
+    });
+  }
+  // Un ingreso suma al stock. Si el material no llevaba control de stock, empieza a llevarlo con lo ingresado.
+  async function adjustPurchase(oldItems, newItems) {
+    const delta = new Map();
+    (newItems || []).forEach(x => { const k = norm(x.name); delta.set(k, (delta.get(k) || 0) + (Number(x.qty) || 0)); });
+    (oldItems || []).forEach(x => { const k = norm(x.name); delta.set(k, (delta.get(k) || 0) - (Number(x.qty) || 0)); });
+    for (const [k, d] of delta) {
+      if (!d) continue;
+      const m = materials.find(x => norm(x.name) === k);
+      if (!m) continue;
+      if (!tracked(m)) { if (d < 0) continue; m.stock = 0; }
+      m.stock = Math.round((m.stock + d) * 100) / 100;
+      try { await put('materials', m); } catch (_) { /* sin espacio: se queda en memoria */ }
+    }
+  }
+  const purchaseSummary = p => {
+    const n = (p.items || []).length;
+    return [n ? plural(n, 'material', 'materiales') : '', (p.photos || []).length ? `📎 ${plural(p.photos.length, 'foto', 'fotos')}` : ''].filter(Boolean).join(' · ');
+  };
+
+  function purchasesSheet() {
+    const list = sortedPurchases();
+    openSheet(`
+      <h2>Banco de materiales</h2>
+      ${matTabs('buys')}
+      <button type="button" class="btn primary block" id="pnew">+ Nuevo ingreso</button>
+      <div id="plist">${list.length ? list.map(p => `<button type="button" class="person" data-id="${esc(p.id)}"><strong>${esc(shortDate(p.date))}${p.vendor ? ` · ${esc(p.vendor)}` : ''}</strong><span class="meta">${esc(purchaseSummary(p)) || 'Sin detalle'}</span></button>`).join('')
+        : '<div class="empty"><strong>Aún no hay ingresos</strong><span>Registra una compra de material: suma al stock y puedes guardar la foto de la factura como respaldo.</span></div>'}</div>
+      <div class="actions"><button type="button" class="btn ghost block" data-close>Cerrar</button></div>`);
+    bindMatTabs();
+    $('#pnew').onclick = () => purchaseSheet(null);
+    $('#plist').addEventListener('click', ev => { const b = ev.target.closest('.person'); if (b) purchaseSheet(b.dataset.id); });
+  }
+
+  function purchaseSheet(pid) {
+    const old = pid ? purchases.find(x => x.id === pid) : null;
+    const isNew = !old;
+    let date = old ? old.date : todayStr();
+    let items = old ? (old.items || []).map(x => ({ ...x })) : [];
+    let photos = old && old.photos ? [...old.photos] : [];
+    openSheet(`
+      <h2>${isNew ? 'Nuevo ingreso' : 'Editar ingreso'}</h2>
+      <span class="lbl">Fecha</span>
+      <div class="chips" id="pdchips">
+        <button type="button" data-d="0">Hoy</button>
+        <button type="button" data-d="-1">Ayer</button>
+        <button type="button" data-d="-2">Hace 2 días</button>
+        <input type="date" id="pdate" aria-label="Elegir fecha" value="${date}">
+      </div>
+      <label class="lbl" for="pvendor">Tienda o proveedor (opcional)</label>
+      <input class="field" id="pvendor" type="text" placeholder="Ej. Rexel, ferretería…" value="${esc(old ? old.vendor || '' : '')}" autocomplete="off">
+      <span class="lbl">Material que entra</span>
+      <div class="mlist" id="pmlist"></div>
+      <div class="madd">
+        <input id="pname" class="mfull" type="text" placeholder="Buscar o escribir material" aria-label="Material" autocomplete="off">
+        <div class="msug mfull" id="pmsug"></div>
+        <input id="pqty" type="number" inputmode="decimal" min="0" step="any" value="1" aria-label="Cantidad">
+        <select id="punit" aria-label="Unidad">${unitOpts('ud')}</select>
+        <button type="button" class="btn" id="padd">Añadir</button>
+      </div>
+      <span class="lbl">Foto de la factura (opcional)</span>
+      <div class="thumbs" id="pthumbs"></div>
+      <p class="hint" id="pstatus" hidden></p>
+      <div class="btnrow">
+        <label class="btn" for="pcam">Tomar foto</label>
+        <label class="btn" for="pfiles">Desde galería</label>
+      </div>
+      <input id="pcam" type="file" accept="image/*" capture="environment" hidden>
+      <input id="pfiles" type="file" accept="image/*" multiple hidden>
+      <p class="hint">La foto solo sirve de respaldo, no se lee. Toca una foto para verla grande. Al guardar, las cantidades se suman al stock.</p>
+      <div class="actions">
+        <button type="button" class="btn primary block" id="psave">Guardar</button>
+        <button type="button" class="btn ghost block" id="pback">Volver a ingresos</button>
+        ${isNew ? '' : '<button type="button" class="btn danger block" id="pdel">Eliminar ingreso</button>'}
+      </div>
+      ${isNew ? '' : '<p class="hint">Eliminar o cambiar un ingreso ajusta el stock en consecuencia.</p>'}`);
+    $('#pback').onclick = purchasesSheet;
+
+    const syncChips = () => {
+      const t = todayStr();
+      $('#pdchips').querySelectorAll('button').forEach(b => b.classList.toggle('on', addDays(t, Number(b.dataset.d)) === date));
+      $('#pdate').value = date;
+    };
+    $('#pdchips').addEventListener('click', e => { const b = e.target.closest('button[data-d]'); if (b) { date = addDays(todayStr(), Number(b.dataset.d)); syncChips(); } });
+    $('#pdate').addEventListener('change', e => { if (e.target.value) { date = e.target.value; syncChips(); } });
+    syncChips();
+
+    const drawItems = () => {
+      $('#pmlist').innerHTML = items.map((m, i) => `<div class="mrow"><span>${fmtMat(m)}</span><button type="button" class="x2" data-i="${i}" aria-label="Quitar ${esc(m.name)}">✕</button></div>`).join('');
+    };
+    drawItems();
+    $('#pmlist').addEventListener('click', ev => { const x = ev.target.closest('.x2'); if (x) { items.splice(Number(x.dataset.i), 1); drawItems(); } });
+    $('#pname').addEventListener('input', () => {
+      const q = norm($('#pname').value);
+      const hits = q ? sortedMats().filter(m => norm(m.name).includes(q)).slice(0, 6) : [];
+      $('#pmsug').innerHTML = hits.map(m => `<button type="button" class="sug" data-id="${esc(m.id)}">${esc(m.name)} <small>${tracked(m) ? `${fmtQty(m.stock)} en stock` : esc(m.unit === 'ud' ? 'unidades' : m.unit)}</small></button>`).join('');
+    });
+    $('#pmsug').addEventListener('click', ev => {
+      const b = ev.target.closest('.sug');
+      if (!b) return;
+      const m = materials.find(x => x.id === b.dataset.id);
+      $('#pname').value = m.name; $('#punit').value = m.unit || 'ud';
+      $('#pmsug').innerHTML = '';
+      $('#pqty').focus(); $('#pqty').select();
+    });
+    const addItem = async () => {
+      const name = $('#pname').value.trim();
+      if (!name) { toast('Escribe el material'); return; }
+      const qty = Number($('#pqty').value.replace(',', '.'));
+      const known = findMat(name);
+      const unit = known ? (known.unit || 'ud') : $('#punit').value;
+      const q = qty > 0 ? qty : 1;
+      const same = items.find(x => norm(x.name) === norm(name));
+      if (same) same.qty = Math.round((same.qty + q) * 100) / 100; else items.push({ name: known ? known.name : name, unit, qty: q });
+      if (!known) {
+        const m = { id: uid(), name, unit, created: Date.now() };
+        try { await put('materials', m); materials.push(m); } catch (_) { /* queda en el ingreso igualmente */ }
+      }
+      $('#pname').value = ''; $('#pqty').value = '1'; $('#punit').value = 'ud'; $('#pmsug').innerHTML = '';
+      drawItems();
+      $('#pname').focus();
+    };
+    $('#padd').onclick = addItem;
+    $('#pname').addEventListener('keydown', ev => { if (ev.key === 'Enter') { ev.preventDefault(); addItem(); } });
+
+    const drawThumbs = () => {
+      $('#pthumbs').innerHTML = photos.map((p, i) => `<div class="t"><img src="${photoSrc(p)}" alt="Factura ${i + 1}" data-v="${i}"><button type="button" class="x" data-i="${i}" aria-label="Quitar foto ${i + 1}">✕</button></div>`).join('');
+    };
+    $('#pthumbs').addEventListener('click', e => {
+      const x = e.target.closest('.x');
+      if (x) { photos.splice(Number(x.dataset.i), 1); drawThumbs(); return; }
+      const im = e.target.closest('img[data-v]');
+      if (im) openViewer(photos, Number(im.dataset.v));
+    });
+    drawThumbs();
+    const addFiles = async e => {
+      const files = [...e.target.files];
+      e.target.value = '';
+      if (!files.length) return;
+      const st = $('#pstatus');
+      st.textContent = 'Procesando fotos…';
+      st.hidden = false;
+      let fail = 0;
+      for (const f of files) {
+        try { photos.push({ src: await compress(f, PURCHASE_MAX, PURCHASE_QUALITY), tag: '', t: Date.now() }); } catch (_) { fail++; }
+      }
+      st.hidden = true;
+      drawThumbs();
+      if (fail) toast(`No se pudieron leer ${plural(fail, 'foto', 'fotos')}`);
+    };
+    $('#pfiles').addEventListener('change', addFiles);
+    $('#pcam').addEventListener('change', addFiles);
+
+    $('#psave').onclick = async () => {
+      if (!items.length && !photos.length) { toast('Añade material o una foto de la factura'); return; }
+      const now = Date.now();
+      const obj = { ...(old || { id: uid(), created: now }), date, vendor: $('#pvendor').value.trim(), items, photos, updated: now };
+      try {
+        await put('purchases', obj);
+      } catch (_) {
+        toast('No se pudo guardar. Puede que no quede espacio en el móvil');
+        return;
+      }
+      await adjustPurchase(old ? old.items : [], items);
+      if (old) purchases[purchases.findIndex(x => x.id === obj.id)] = obj; else purchases.push(obj);
+      render();
+      purchasesSheet();
+      toast('Ingreso guardado');
+    };
+    if (!isNew) {
+      const b = $('#pdel');
+      b.onclick = async () => {
+        if (!b.classList.contains('armed')) { b.classList.add('armed'); b.textContent = 'Toca otra vez para confirmar'; return; }
+        await del('purchases', old.id);
+        await adjustPurchase(old.items, []);
+        purchases = purchases.filter(x => x.id !== old.id);
+        render();
+        purchasesSheet();
+        toast('Ingreso eliminado');
+      };
+    }
   }
 
   function materialSheet(mid, preset) {
@@ -890,6 +1094,322 @@
         toast('Colaborador eliminado');
       };
     }
+  }
+
+  /* ---------- Plan de trabajo (diagrama por obra) ---------- */
+  // Tarea: { id, siteId, name, start, days, part, who, progress, after, gap }
+  // Si tiene "after", empieza `gap` días después de terminar la otra tarea (0 = el mismo día).
+  const COL = 40; // ancho de cada día en el diagrama
+  const PARTS = ['', 'mañana', 'tarde'];
+  const WD = ['D', 'L', 'M', 'X', 'J', 'V', 'S'];
+  const siteTasks = id => tasks.filter(t => t.siteId === id);
+  const taskDays = t => Math.max(1, Math.round(Number(t.days)) || 1);
+  function resolveTasks(list) {
+    const byId = new Map(list.map(t => [t.id, t]));
+    const memo = new Map();
+    const calc = (t, seen) => {
+      if (memo.has(t.id)) return memo.get(t.id);
+      let start = t.start;
+      const pr = t.after ? byId.get(t.after) : null;
+      if (pr && !seen.has(pr.id)) {
+        seen.add(t.id);
+        start = addDays(calc(pr, seen).end, Math.max(0, Math.round(Number(t.gap)) || 0));
+      }
+      const r = { start, end: addDays(start, taskDays(t) - 1) };
+      memo.set(t.id, r);
+      return r;
+    };
+    list.forEach(t => calc(t, new Set()));
+    return memo;
+  }
+  // Tareas que dependen (directa o indirectamente) de una: no pueden ser su predecesora.
+  function taskDescendants(id) {
+    const out = new Set([id]);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      tasks.forEach(t => { if (t.after && out.has(t.after) && !out.has(t.id)) { out.add(t.id); grew = true; } });
+    }
+    return out;
+  }
+  const gapLabel = n => (n === 0 ? 'el mismo día que termina' : n === 1 ? '1 día después de terminar' : `${n} días después de terminar`);
+
+  function ganttHTML(list) {
+    if (!list.length) return '';
+    const res = resolveTasks(list);
+    const rows = [...list].sort((a, b) => res.get(a.id).start.localeCompare(res.get(b.id).start) || (a.created || 0) - (b.created || 0));
+    let min = res.get(rows[0].id).start;
+    let max = min;
+    rows.forEach(t => { const r = res.get(t.id); if (r.start < min) min = r.start; if (r.end > max) max = r.end; });
+    const from = addDays(min, -1);
+    let to = addDays(max, 2);
+    if (dayNum(to) - dayNum(from) < 13) to = addDays(from, 13);
+    const n = dayNum(to) - dayNum(from) + 1;
+    const t0 = todayStr();
+    const off = ds => dayNum(ds) - dayNum(from);
+    const dayCells = [];
+    for (let i = 0; i < n; i++) {
+      const ds = addDays(from, i);
+      const [y, m, d] = ds.split('-').map(Number);
+      const wd = new Date(y, m - 1, d).getDay();
+      dayCells.push({ ds, i, d, m, wd });
+    }
+    const head = dayCells.map(c => `<div class="gh${c.wd === 0 || c.wd === 6 ? ' we' : ''}${c.ds === t0 ? ' today' : ''}" style="left:${c.i * COL}px"><small>${c.i === 0 || c.d === 1 ? MESES[c.m - 1].slice(0, 3) : ''}</small><span>${WD[c.wd]}</span><b>${c.d}</b></div>`).join('');
+    const bg = dayCells.map(c => (c.wd === 0 || c.wd === 6 || c.ds === t0) ? `<i class="gc${c.ds === t0 ? ' today' : ' we'}" style="left:${c.i * COL}px"></i>` : '').join('');
+    const body = rows.map(t => {
+      const r = res.get(t.id);
+      const days = taskDays(t);
+      let left = off(r.start) * COL + 2;
+      let w = days * COL - 4;
+      if (days === 1 && t.part) { w = COL / 2 - 3; if (t.part === 'tarde') left += COL / 2; }
+      const pr = t.progress || 0;
+      const who = t.who ? personName(t.who) : '';
+      const pre = t.after ? list.find(x => x.id === t.after) : null;
+      const lab = `${esc(t.name)}${who ? ` · ${esc(who)}` : ''}${t.part ? ` · ${t.part}` : ''}${pre ? ` · ↳ tras ${esc(pre.name)}` : ''}`;
+      return `<div class="grow"><button type="button" class="glab" data-id="${esc(t.id)}">${lab}</button><button type="button" class="gbar${pr >= 100 ? ' done' : ''}" data-id="${esc(t.id)}" style="left:${left}px;width:${w}px" aria-label="${esc(t.name)}, ${shortDate(r.start)}, ${plural(days, 'día', 'días')}, ${pr}%"><span style="width:${pr}%"></span></button></div>`;
+    }).join('');
+    return `<div class="gantt" id="gantt" data-today="${off(t0)}" data-n="${n}"><div class="gin" style="width:${n * COL}px"><div class="gbg">${bg}</div><div class="ghead">${head}</div>${body}</div></div>`;
+  }
+
+  function planHTML(id) {
+    const list = siteTasks(id);
+    const open = list.filter(t => (t.progress || 0) < 100).length;
+    return `
+      <section class="plan">
+        <h3>Plan de trabajo${list.length ? ` · ${open} por hacer` : ''}</h3>
+        ${list.length ? '' : '<p class="hint">Organiza el trabajo por días: tareas con duración y fecha, y unas pueden empezar tras otras (ej. poner cajas 3 días después de resanar).</p>'}
+        ${ganttHTML(list)}
+        <button type="button" class="btn small" id="addTask">+ Tarea</button>
+      </section>`;
+  }
+  function bindPlan(siteId) {
+    $('#addTask').onclick = () => taskSheet(siteId, null);
+    const g = $('#gantt');
+    if (!g) return;
+    g.addEventListener('click', ev => { const b = ev.target.closest('[data-id]'); if (b) taskSheet(siteId, b.dataset.id); });
+    const t = Number(g.dataset.today);
+    g.scrollLeft = t >= 0 && t < Number(g.dataset.n) ? Math.max(0, (t - 1) * COL) : 0;
+  }
+
+  function taskSheet(siteId, tid, presetStart) {
+    const old = tid ? tasks.find(x => x.id === tid) : null;
+    const others = siteTasks(siteId).filter(x => !old || !taskDescendants(old.id).has(x.id));
+    const res = resolveTasks(siteTasks(siteId));
+    let start = old ? old.start : (presetStart || todayStr());
+    let mode = old && old.after && others.some(x => x.id === old.after) ? 'after' : 'date';
+    let part = old ? old.part || '' : '';
+    let progress = old ? old.progress || 0 : 0;
+    if (old && mode === 'date') start = res.get(old.id).start;
+    openSheet(`
+      <h2>${old ? 'Editar tarea' : 'Nueva tarea'}</h2>
+      <label class="lbl" for="tname">Qué hay que hacer</label>
+      <input class="field" id="tname" type="text" placeholder="Ej. Poner cajas" value="${esc(old ? old.name : '')}" autocomplete="off">
+      <span class="lbl">Cuándo empieza</span>
+      <div class="chips" id="tmode">
+        <button type="button" data-m="date">Un día concreto</button>
+        ${others.length ? '<button type="button" data-m="after">Después de otra tarea</button>' : ''}
+      </div>
+      <div id="tdate">
+        <div class="chips" id="tdchips">
+          <button type="button" data-d="0">Hoy</button>
+          <button type="button" data-d="1">Mañana</button>
+          <button type="button" data-d="2">En 2 días</button>
+          <input type="date" id="tstart" aria-label="Elegir fecha" value="${start}">
+        </div>
+      </div>
+      <div id="tafter" hidden>
+        <select class="field" id="tpre" aria-label="Tarea previa">${others.map(x => `<option value="${esc(x.id)}"${old && old.after === x.id ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}</select>
+        <label class="lbl" for="tgap">Días de espera tras terminar (0 = el mismo día)</label>
+        <input class="field" id="tgap" type="number" inputmode="numeric" min="0" step="1" value="${old && old.after ? Math.max(0, Number(old.gap) || 0) : 1}">
+      </div>
+      <p class="hint" id="tinfo"></p>
+      <label class="lbl" for="tdays">Duración (días)</label>
+      <input class="field" id="tdays" type="number" inputmode="numeric" min="1" step="1" value="${old ? taskDays(old) : 1}">
+      <span class="lbl">Parte del día (si dura un día)</span>
+      <div class="chips" id="tpart">
+        <button type="button" data-p="">Todo el día</button>
+        <button type="button" data-p="mañana">Mañana</button>
+        <button type="button" data-p="tarde">Tarde</button>
+      </div>
+      ${people.length ? `<label class="lbl" for="twho">Responsable</label><select class="field" id="twho">${peopleOptions(old ? old.who : '')}</select>` : ''}
+      <span class="lbl">Avance</span>
+      <div class="chips" id="tprog">${[0, 25, 50, 75, 100].map(v => `<button type="button" data-v="${v}">${v}%</button>`).join('')}</div>
+      <div class="actions">
+        <button type="button" class="btn primary block" id="tsave">Guardar</button>
+        <button type="button" class="btn ghost block" data-close>Cancelar</button>
+        ${old ? '<button type="button" class="btn danger block" id="tdel">Eliminar tarea</button>' : ''}
+      </div>`);
+    const sync = () => {
+      $('#tmode').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.m === mode));
+      $('#tdate').hidden = mode !== 'date';
+      $('#tafter').hidden = mode !== 'after';
+      const t = todayStr();
+      $('#tdchips').querySelectorAll('button').forEach(b => b.classList.toggle('on', addDays(t, Number(b.dataset.d)) === start));
+      $('#tstart').value = start;
+      $('#tpart').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.p === part));
+      $('#tprog').querySelectorAll('button').forEach(b => b.classList.toggle('on', Number(b.dataset.v) === progress));
+      const days = Math.max(1, Math.round(Number($('#tdays').value)) || 1);
+      let st = start;
+      if (mode === 'after') {
+        const pr = res.get($('#tpre').value);
+        const gap = Math.max(0, Math.round(Number($('#tgap').value)) || 0);
+        st = pr ? addDays(pr.end, gap) : start;
+        $('#tinfo').textContent = `Empieza ${dayShort(st)} (${gapLabel(gap)} «${(others.find(x => x.id === $('#tpre').value) || {}).name || ''}»). Termina ${dayShort(addDays(st, days - 1))}.`;
+      } else {
+        $('#tinfo').textContent = `Termina ${dayShort(addDays(st, days - 1))}.`;
+      }
+      return st;
+    };
+    $('#tmode').addEventListener('click', e => { const b = e.target.closest('button[data-m]'); if (b) { mode = b.dataset.m; sync(); } });
+    $('#tdchips').addEventListener('click', e => { const b = e.target.closest('button[data-d]'); if (b) { start = addDays(todayStr(), Number(b.dataset.d)); sync(); } });
+    $('#tstart').addEventListener('change', e => { if (e.target.value) { start = e.target.value; sync(); } });
+    $('#tpart').addEventListener('click', e => { const b = e.target.closest('button[data-p]'); if (b) { part = b.dataset.p; sync(); } });
+    $('#tprog').addEventListener('click', e => { const b = e.target.closest('button[data-v]'); if (b) { progress = Number(b.dataset.v); sync(); } });
+    ['#tpre', '#tgap', '#tdays'].forEach(sel => { const el = $(sel); if (el) el.addEventListener('input', sync); });
+    sync();
+    if (!old) $('#tname').focus();
+
+    $('#tsave').onclick = async () => {
+      const name = $('#tname').value.trim();
+      if (!name) { toast('Escribe qué hay que hacer'); return; }
+      const st = sync();
+      const now = Date.now();
+      const obj = { ...(old || { id: uid(), siteId, created: now }), name, start: st, days: Math.max(1, Math.round(Number($('#tdays').value)) || 1), part, progress, who: people.length ? $('#twho').value : (old ? old.who || '' : ''), updated: now };
+      if (mode === 'after') { obj.after = $('#tpre').value; obj.gap = Math.max(0, Math.round(Number($('#tgap').value)) || 0); } else { delete obj.after; delete obj.gap; }
+      try { await put('tasks', obj); } catch (_) { toast('No se pudo guardar'); return; }
+      if (old) tasks[tasks.findIndex(x => x.id === obj.id)] = obj; else tasks.push(obj);
+      closeSheet();
+      render();
+      toast('Guardado');
+    };
+    if (old) {
+      const b = $('#tdel');
+      b.onclick = async () => {
+        if (!b.classList.contains('armed')) { b.classList.add('armed'); b.textContent = 'Toca otra vez para confirmar'; return; }
+        // Las tareas que dependían de esta se quedan en su fecha actual.
+        for (const t of siteTasks(siteId).filter(x => x.after === old.id)) {
+          const fixed = { ...t, start: res.get(t.id).start };
+          delete fixed.after; delete fixed.gap;
+          await put('tasks', fixed);
+          tasks[tasks.findIndex(x => x.id === t.id)] = fixed;
+        }
+        await del('tasks', old.id);
+        tasks = tasks.filter(x => x.id !== old.id);
+        closeSheet();
+        render();
+        toast('Tarea eliminada');
+      };
+    }
+  }
+
+  /* ---------- Plan general: semana y mes ---------- */
+  const PL = { mode: (() => { try { return localStorage.getItem('obrario.plan') === 'mes' ? 'mes' : 'semana'; } catch (_) { return 'semana'; } })(), date: null, sel: null };
+  const setPlanMode = m => { PL.mode = m; try { localStorage.setItem('obrario.plan', m); } catch (_) { /* sin almacenamiento */ } };
+  const monStart = ds => { const [y, m, d] = ds.split('-').map(Number); return addDays(ds, -((new Date(y, m - 1, d).getDay() + 6) % 7)); };
+  function planRanges() {
+    const map = new Map();
+    sites.forEach(s => { const l = siteTasks(s.id); if (l.length) resolveTasks(l).forEach((r, id) => map.set(id, r)); });
+    return map;
+  }
+  const slotRank = t => (t === 'mañana' ? 1 : t === 'tarde' ? 3 : 2);
+  function planItems(ds, ranges) {
+    const out = [];
+    sites.forEach(st => {
+      siteTasks(st.id).forEach(t => {
+        const r = ranges.get(t.id);
+        if (r && r.start <= ds && ds <= r.end) out.push({ k: 't', t, st, r, rank: slotRank(t.part), key: '' });
+      });
+      visits.filter(v => v.siteId === st.id && v.date === ds).forEach(v => out.push({ k: 'v', v, st, rank: v.time ? (v.time < '14:00' ? 1 : 3) : 2, key: v.time || '' }));
+    });
+    return out.sort((a, b) => a.rank - b.rank || a.key.localeCompare(b.key) || a.st.name.localeCompare(b.st.name, 'es'));
+  }
+  function planItemHTML(it, ds) {
+    if (it.k === 't') {
+      const { t, st, r } = it;
+      const total = taskDays(t);
+      const n = dayNum(ds) - dayNum(r.start) + 1;
+      const who = t.who ? personName(t.who) : '';
+      const pr = t.progress || 0;
+      const meta = [t.name + (total > 1 ? ` (día ${n}/${total})` : ''), t.part, who && `con ${who}`, pr >= 100 ? 'hecha ✓' : pr ? `${pr}%` : ''].filter(Boolean).join(' · ');
+      return `<button type="button" class="pitem task${pr >= 100 ? ' done' : ''}" data-k="t" data-s="${esc(st.id)}" data-id="${esc(t.id)}"><strong>${esc(st.name)}</strong><span class="meta">${esc(meta)}</span></button>`;
+    }
+    const { v, st } = it;
+    const who = v.assignee ? personName(v.assignee) : '';
+    const first = (v.note || '').split('\n')[0];
+    const meta = [KIND[v.kind], v.time, who && `con ${who}`, first].filter(Boolean).join(' · ');
+    return `<button type="button" class="pitem visit-i" data-k="v" data-id="${esc(v.id)}"><strong>${esc(st.name)}</strong><span class="meta">${esc(meta)}</span></button>`;
+  }
+  const cap = t => t.charAt(0).toUpperCase() + t.slice(1);
+  function planDayHTML(ds, ranges, long) {
+    const t0 = todayStr();
+    const items = planItems(ds, ranges);
+    return `<section class="pday${ds === t0 ? ' today' : ''}"><div class="pdh"><h3>${cap(long ? longDate(ds) : dayShort(ds))}${ds === t0 ? ' · hoy' : ''}</h3><button type="button" class="pplus" data-d="${ds}" aria-label="Añadir tarea el ${dayShort(ds)}">+</button></div>${items.length ? items.map(i => planItemHTML(i, ds)).join('') : '<p class="meta">Libre</p>'}</section>`;
+  }
+  function pickSiteForTask(ds) {
+    if (!sites.length) { toast('Primero crea un sitio'); return; }
+    if (sites.length === 1) { taskSheet(sites[0].id, null, ds); return; }
+    const list = [...sites].sort((a, b) => a.name.localeCompare(b.name, 'es'));
+    openSheet(`<h2>¿En qué sitio?</h2>${list.map(x => `<button type="button" class="person" data-s="${esc(x.id)}"><strong>${esc(x.name)}</strong></button>`).join('')}<div class="actions"><button type="button" class="btn ghost block" data-close>Cancelar</button></div>`);
+    $('#sheet').querySelectorAll('.person').forEach(b => { b.onclick = () => taskSheet(b.dataset.s, null, ds); });
+  }
+  const planCountToday = () => { const r = planRanges(); return planItems(todayStr(), r).filter(i => i.k === 'v' || (i.t.progress || 0) < 100).length; };
+
+  function renderPlan() {
+    const t0 = todayStr();
+    if (!PL.date) PL.date = t0;
+    const ranges = planRanges();
+    let label, body;
+    const mon = ds => MESES[Number(ds.split('-')[1]) - 1].slice(0, 3);
+    if (PL.mode === 'semana') {
+      const ws = monStart(PL.date);
+      const we = addDays(ws, 6);
+      label = `${Number(ws.split('-')[2])} ${mon(ws)} – ${Number(we.split('-')[2])} ${mon(we)} ${we.split('-')[0]}`;
+      body = Array.from({ length: 7 }, (_, i) => planDayHTML(addDays(ws, i), ranges, false)).join('');
+    } else {
+      const first = PL.date.slice(0, 7) + '-01';
+      const last = addDays(addMonths(first, 1), -1);
+      const gs = monStart(first);
+      const ge = addDays(monStart(last), 6);
+      const [fy, fm] = first.split('-').map(Number);
+      label = cap(`${MESES[fm - 1]} ${fy}`);
+      const sel = PL.sel && PL.sel.slice(0, 7) === first.slice(0, 7) ? PL.sel : (t0.slice(0, 7) === first.slice(0, 7) ? t0 : first);
+      PL.sel = sel;
+      const cells = [];
+      for (let ds = gs; ds <= ge; ds = addDays(ds, 1)) {
+        const items = planItems(ds, ranges);
+        const nt = items.filter(i => i.k === 't').length;
+        const nv = items.length - nt;
+        const dots = '<i class="dt"></i>'.repeat(Math.min(nt, 3)) + '<i class="dv"></i>'.repeat(Math.min(nv, 2));
+        cells.push(`<button type="button" class="mcell${ds.slice(0, 7) !== first.slice(0, 7) ? ' out' : ''}${ds === t0 ? ' today' : ''}${ds === sel ? ' sel' : ''}" data-d="${ds}" aria-label="${longDate(ds)}${items.length ? `, ${plural(items.length, 'cosa', 'cosas')}` : ''}"><b>${Number(ds.split('-')[2])}</b><span class="dots">${dots}</span></button>`);
+      }
+      body = `<div class="mgrid mhead">${WD.slice(1).concat(WD[0]).map(x => `<span>${x}</span>`).join('')}</div><div class="mgrid" id="mgrid">${cells.join('')}</div>${planDayHTML(sel, ranges, true)}`;
+    }
+    app.innerHTML = `
+      <a class="back" href="#/">‹ Todos los sitios</a>
+      <h1>Plan</h1>
+      <div class="chips" id="pmode"><button type="button" data-m="semana"${PL.mode === 'semana' ? ' class="on"' : ''}>Semana</button><button type="button" data-m="mes"${PL.mode === 'mes' ? ' class="on"' : ''}>Mes</button></div>
+      <div class="pnav"><button type="button" class="btn small" id="pprev" aria-label="Anterior">‹</button><strong>${esc(label)}</strong><button type="button" class="btn small" id="pnext" aria-label="Siguiente">›</button><button type="button" class="btn small" id="ptoday">Hoy</button></div>
+      <div id="pbody">${body}</div>
+      <p class="hint">Aquí salen las tareas de todas tus obras y tus visitas. Toca una para abrirla o el + de un día para añadir una tarea.</p>`;
+    $('#pmode').addEventListener('click', e => { const b = e.target.closest('button[data-m]'); if (b) { setPlanMode(b.dataset.m); renderPlan(); } });
+    const step = dir => {
+      if (PL.mode === 'semana') PL.date = addDays(PL.date, 7 * dir);
+      else { PL.date = addMonths(PL.date.slice(0, 7) + '-01', dir); PL.sel = null; }
+      renderPlan();
+    };
+    $('#pprev').onclick = () => step(-1);
+    $('#pnext').onclick = () => step(1);
+    $('#ptoday').onclick = () => { PL.date = todayStr(); PL.sel = null; renderPlan(); };
+    $('#pbody').addEventListener('click', e => {
+      const c = e.target.closest('.mcell');
+      if (c) { PL.sel = c.dataset.d; renderPlan(); return; }
+      const plus = e.target.closest('.pplus');
+      if (plus) { pickSiteForTask(plus.dataset.d); return; }
+      const it = e.target.closest('.pitem');
+      if (!it) return;
+      if (it.dataset.k === 't') taskSheet(it.dataset.s, it.dataset.id); else visitSheet(it.dataset.id);
+    });
+    setDock('+ Tarea', () => pickSiteForTask(PL.mode === 'mes' && PL.sel ? PL.sel : todayStr()));
   }
 
   /* ---------- Pendientes ---------- */
@@ -1213,9 +1733,11 @@
         }
         for (const e of siteEntries(site.id)) { await del('entries', e.id); await adjustStock(e.materials, []); }
         for (const v of visits.filter(x => x.siteId === site.id)) await del('visits', v.id);
+        for (const t of tasks.filter(x => x.siteId === site.id)) await del('tasks', t.id);
         await del('sites', site.id);
         entries = entries.filter(e => e.siteId !== site.id);
         visits = visits.filter(v => v.siteId !== site.id);
+        tasks = tasks.filter(t => t.siteId !== site.id);
         sites = sites.filter(x => x.id !== site.id);
         closeSheet();
         location.hash = '#/';
@@ -1581,8 +2103,9 @@
 
   /* ---------- Copia de seguridad ---------- */
   function backupSheet() {
-    const photoCount = entries.reduce((n, e) => n + (e.photos ? e.photos.length : 0), 0);
-    const bytes = entries.reduce((n, e) => n + (e.photos || []).reduce((m, p) => m + photoSrc(p).length * 0.75, 0), 0);
+    const withPhotos = [...entries, ...purchases];
+    const photoCount = withPhotos.reduce((n, e) => n + (e.photos ? e.photos.length : 0), 0);
+    const bytes = withPhotos.reduce((n, e) => n + (e.photos || []).reduce((m, p) => m + photoSrc(p).length * 0.75, 0), 0);
     openSheet(`
       <h2>Copia de seguridad</h2>
       <div class="stats">
@@ -1591,6 +2114,8 @@
         <span><b>${visits.length}</b> en agenda</span>
         <span><b>${people.length}</b> colaboradores</span>
         <span><b>${materials.length}</b> materiales</span>
+        <span><b>${purchases.length}</b> ingresos</span>
+        <span><b>${tasks.length}</b> tareas</span>
         <span><b>${photoCount}</b> fotos</span>
         <span><b>${(bytes / 1048576).toFixed(1)}</b> MB</span>
       </div>
@@ -1607,7 +2132,7 @@
   }
 
   async function exportBackup() {
-    const data = { app: 'obrario', version: 4, exported: new Date().toISOString(), sites, entries, visits, people, materials };
+    const data = { app: 'obrario', version: 6, exported: new Date().toISOString(), sites, entries, visits, people, materials, purchases, tasks };
     const name = `obrario-${todayStr()}.json`;
     const file = new File([JSON.stringify(data)], name, { type: 'application/json' });
     try {
@@ -1639,14 +2164,20 @@
       for (const x of ps) await put('people', x);
       const ms = Array.isArray(data.materials) ? data.materials : [];
       for (const x of ms) await put('materials', x);
+      const pu = Array.isArray(data.purchases) ? data.purchases : [];
+      for (const x of pu) await put('purchases', x);
+      const tk = Array.isArray(data.tasks) ? data.tasks : [];
+      for (const x of tk) await put('tasks', x);
       sites = await getAll('sites');
       entries = await getAll('entries');
       visits = await getAll('visits');
       people = await getAll('people');
       materials = await getAll('materials');
+      purchases = await getAll('purchases');
+      tasks = await getAll('tasks');
       closeSheet();
       render();
-      toast(`Importado: ${plural(data.sites.length, 'sitio', 'sitios')}, ${plural(data.entries.length, 'entrada', 'entradas')} y ${plural(vs.length, 'cita', 'citas')} de agenda`);
+      toast(`Importado: ${plural(data.sites.length, 'sitio', 'sitios')}, ${plural(data.entries.length, 'entrada', 'entradas')} y ${plural(vs.length, 'cita', 'citas')} de agenda${pu.length ? `, ${plural(pu.length, 'ingreso', 'ingresos')}` : ''}${tk.length ? ` y ${plural(tk.length, 'tarea', 'tareas')}` : ''}`);
     } catch (_) {
       toast('Ese archivo no es una copia de Obrario');
     }
@@ -1665,6 +2196,8 @@
       visits = await getAll('visits');
       people = await getAll('people');
       materials = await getAll('materials');
+      purchases = await getAll('purchases');
+      tasks = await getAll('tasks');
     } catch (_) {
       app.innerHTML = '<div class="empty"><strong>No se pudo abrir el almacenamiento</strong><span>Abre Obrario en una pestaña normal, no en modo privado, y vuelve a intentarlo.</span></div>';
       return;
